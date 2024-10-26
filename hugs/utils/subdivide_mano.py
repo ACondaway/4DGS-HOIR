@@ -1,7 +1,5 @@
-#
-# For licensing see accompanying LICENSE file.
-# Copyright (C) 2024 Apple Inc. All Rights Reserved.
-#
+# Update
+# Modified from HuGS, Apple.Inc 2024
 
 import torch 
 import trimesh 
@@ -10,7 +8,6 @@ from trimesh import grouping
 from trimesh.geometry import faces_to_edges  
 
 
-from hugs.models.modules.smpl_layer import SMPL
 from hugs.models.modules.mano_layer import MANO
 
 
@@ -69,70 +66,8 @@ def subdivide(
             else:             
                 attr_mid = values[edges[unique]].mean(axis=1)                      
             new_attributes[key] = np.vstack((values, attr_mid))     
-    return new_vertices, new_faces, new_attributes   
+    return new_vertices, new_faces, new_attributes
 
-
-def _subdivide_smpl_model(smpl=None, smoothing=False):     
-    if smpl is None:         
-        smpl = SMPL("data/smpl")     
-             
-    n_verts = smpl.v_template.shape[0]     
-    init_posedirs = smpl.posedirs.detach().cpu().numpy()     
-    init_lbs_weights = smpl.lbs_weights.detach().cpu().numpy()     
-    init_shapedirs = smpl.shapedirs.detach().cpu().numpy()     
-    init_v_id = smpl.v_id      
-    init_shapedirs = init_shapedirs.reshape(n_verts, -1)     
-    init_J_regressor = smpl.J_regressor.detach().cpu().numpy().transpose(1, 0)          
-    init_vertices = smpl.v_template.detach().cpu().numpy()     
-    init_faces = smpl.faces      
-    print("# vertices before subdivision:", init_vertices.shape)          
-    sub_vertices, sub_faces, attr = subdivide(
-        vertices=init_vertices,         
-        faces=init_faces,         
-        vertex_attributes={
-            "v_id": init_v_id,             
-            "lbs_weights": init_lbs_weights,            
-            "shapedirs": init_shapedirs,             
-            "J_regressor": init_J_regressor,         
-        }     
-    )
-    
-    if smoothing:
-        sub_mesh = trimesh.Trimesh(vertices=sub_vertices, faces=sub_faces)         
-        sub_mesh = trimesh.smoothing.filter_mut_dif_laplacian(
-            sub_mesh, 
-            lamb=0.5,
-            iterations=5,
-            volume_constraint=True,
-            laplacian_operator=None
-        )        
-        sub_vertices = sub_mesh.vertices
-                       
-    new_smpl = SMPL("data/smpl")     
-    new_smpl.lbs_weights = torch.from_numpy(attr["lbs_weights"]).float()
-    posedirs = np.zeros((207, sub_vertices.shape[0] * 3)).astype(np.float32)
-    shapedirs = attr["shapedirs"].reshape(-1, 3, 10)
-    J_regressor = np.zeros_like(attr["J_regressor"].transpose(1, 0))
-    J_regressor[:, :n_verts] = smpl.J_regressor
-    new_smpl.posedirs = torch.from_numpy(posedirs).float()
-    new_smpl.shapedirs = torch.from_numpy(shapedirs).float()
-    new_smpl.v_template = torch.from_numpy(sub_vertices).float()
-    new_smpl.faces_tensor = torch.from_numpy(sub_faces).long()
-    new_smpl.J_regressor = torch.from_numpy(J_regressor).float()
-    new_smpl.faces = sub_faces     
-    new_smpl.v_id = attr["v_id"].astype(int)
-    return new_smpl    
-
-
-def subdivide_smpl_model(smpl=None, smoothing=False, n_iter=1):     
-    if smpl is None:         
-        from hugs.cfg.constants import SMPL_PATH         
-        smpl = SMPL(SMPL_PATH)          
-    
-    smpl.v_id = np.arange(6890)[..., None]     
-    for _ in range(n_iter):         
-        smpl = _subdivide_smpl_model(smpl, smoothing)     
-    return smpl
 
 
 def _subdivide_mano_model(mano=None, smoothing=False): 
@@ -145,8 +80,8 @@ def _subdivide_mano_model(mano=None, smoothing=False):
     init_shapedirs = mano.shapedirs.detach().cpu().numpy()     
     init_v_id = mano.v_id      
     init_shapedirs = init_shapedirs.reshape(n_verts, -1)     
-    init_J_regressor = smpl.J_regressor.detach().cpu().numpy().transpose(1, 0)          
-    init_vertices = smpl.v_template.detach().cpu().numpy()     
+    init_J_regressor = mano.J_regressor.detach().cpu().numpy().transpose(1, 0)          
+    init_vertices = mano.v_template.detach().cpu().numpy()     
     init_faces = mano.faces      
     print("# vertices before subdivision:", init_vertices.shape)          
     sub_vertices, sub_faces, attr = subdivide(
@@ -191,7 +126,7 @@ def _subdivide_mano_model(mano=None, smoothing=False):
     if mano is None:         
         from hugs.cfg.constants import MANO_PATH         
         mano = MANO(MANO_PATH)          
-    
+    # 778 or 6890?
     mano.v_id = np.arange(778)[..., None]     
     for _ in range(n_iter):         
         mano = _subdivide_mano_model(mano, smoothing)     

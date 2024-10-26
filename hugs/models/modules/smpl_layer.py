@@ -3,7 +3,7 @@
 
 #
 # For licensing see accompanying LICENSE file.
-# Copyright (C) 2024 Apple Inc. All Rights Reserved.
+# Copyright (C) 2024 µApple Inc. All Rights Reserved.
 #
 
 import os
@@ -33,6 +33,7 @@ from smplx.vertex_joint_selector import VertexJointSelector
 
 
 from .lbs import lbs_extra, lbs
+# 加在哪里
 
 
 TensorOutput = namedtuple('TensorOutput',
@@ -343,7 +344,7 @@ class SMPL(nn.Module):
         if betas.shape[0] != batch_size:
             num_repeats = int(batch_size / betas.shape[0])
             betas = betas.expand(num_repeats, -1)
-
+# 有修改
         _, joints, A, T, v_posed, v_shaped, shape_offsets, pose_offsets = lbs(
             betas, 
             full_pose, 
@@ -597,7 +598,7 @@ class SMPLLayer(SMPL):
                                 dtype=dtype, device=device)
         if transl is None:
             transl = torch.zeros([batch_size, 3], dtype=dtype, device=device)
-        
+ # 有修改       
         if body_pose.shape[-1] == 69:
             full_pose_aa = torch.cat([global_orient, body_pose], dim=-1)
             full_pose = batch_rodrigues(full_pose_aa.reshape(-1, 3)).reshape(-1, self.NUM_BODY_JOINTS+1, 3, 3)

@@ -8,7 +8,10 @@ import trimesh
 from torch import nn
 from loguru import logger
 import torch.nn.functional as F
-from hugs.models.hugs_wo_trimlp import smpl_lbsmap_top_k, smpl_lbsweight_top_k
+# modified by lyt
+import numpy as np
+# end of modification
+from hugs.models.hugs_wo_trimlp import mano_lbsmap_top_k, mano_lbsweight_top_k
 
 from hugs.utils.general import (
     inverse_sigmoid, 
@@ -26,11 +29,11 @@ from hugs.utils.rotations import (
     rotation_6d_to_matrix,
     torch_rotation_matrix_from_vectors,
 )
-from hugs.cfg.constants import SMPL_PATH
-from hugs.utils.subdivide_smpl import subdivide_smpl_model
+from hugs.cfg.constants import MANO_PATH
+from hugs.utils.subdivide_mano import subdivide_mano_model
 
 from .modules.lbs import lbs_extra
-from .modules.smpl_layer import SMPL
+from .modules.mano_layer import MANO
 from .modules.triplane import TriPlane
 from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDecoder
 
@@ -38,7 +41,7 @@ from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDec
 SCALE_Z = 1e-5
 
 
-class HUGS_TRIMLP:
+class BIHOGS_TRIMLP:
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
@@ -72,6 +75,11 @@ class HUGS_TRIMLP:
         disable_posedirs=False,
         triplane_res=256,
         betas=None,
+        # modified by lyt
+        object_gaussian_params_path=None,
+        left_hand_gaussian_params_path=None,
+        right_hand_gaussian_params_path=None,
+        # end of modification
     ):
         self.only_rgb = only_rgb
         self.active_sh_degree = 0
@@ -94,7 +102,7 @@ class HUGS_TRIMLP:
         self.use_deformer = use_deformer
         self.disable_posedirs = disable_posedirs
         
-        self.deformer = 'smpl'
+        self.deformer = 'mano'
         
         if betas is not None:
             self.create_betas(betas, requires_grad=False)
@@ -106,16 +114,25 @@ class HUGS_TRIMLP:
         self.geometry_dec = GeometryDecoder(n_features=n_features*3, use_surface=use_surface).to('cuda')
         
         if n_subdivision > 0:
-            logger.info(f"Subdividing SMPL model {n_subdivision} times")
-            self.smpl_template = subdivide_smpl_model(smoothing=True, n_iter=n_subdivision).to(self.device)
+            logger.info(f"Subdividing MANO model {n_subdivision} times")
+            self.mano_template = subdivide_mano_model(smoothing=True, n_iter=n_subdivision).to(self.device)
         else:
-            self.smpl_template = SMPL(SMPL_PATH).to(self.device)
+            self.mano_template = MANO(MANO_PATH).to(self.device)
             
-        self.smpl = SMPL(SMPL_PATH).to(self.device)
-            
+        self.mano = MANO(MANO_PATH).to(self.device)
+        
+        # modified by lyt
+        # Additional setup for Gaussian cloud, if paths are provided
+        if object_gaussian_params_path:
+            self.create_from_gaussian_params(object_gaussian_params_path, "object")
+        if left_hand_gaussian_params_path:
+            self.create_from_gaussian_params(left_hand_gaussian_params_path, "left_hand")
+        if right_hand_gaussian_params_path:
+            self.create_from_gaussian_params(right_hand_gaussian_params_path, "right_hand")
+        # end of modification
         edges = trimesh.Trimesh(
-            vertices=self.smpl_template.v_template.detach().cpu().numpy(), 
-            faces=self.smpl_template.faces, process=False
+            vertices=self.mano_template.v_template.detach().cpu().numpy(), 
+            faces=self.mano_template.faces, process=False
         ).edges_unique
         self.edges = torch.from_numpy(edges).to(self.device).long()
         
@@ -124,10 +141,10 @@ class HUGS_TRIMLP:
         
         self.setup_functions()
     
-    def create_body_pose(self, body_pose, requires_grad=False):
-        body_pose = axis_angle_to_rotation_6d(body_pose.reshape(-1, 3)).reshape(-1, 23*6)
-        self.body_pose = nn.Parameter(body_pose, requires_grad=requires_grad)
-        logger.info(f"Created body pose with shape: {body_pose.shape}, requires_grad: {requires_grad}")
+    def create_hand_pose(self, hand_pose, requires_grad=False):
+        hand_pose = axis_angle_to_rotation_6d(hand_pose.reshape(-1, 3)).reshape(-1, 23*6)
+        self.hand_pose = nn.Parameter(hand_pose, requires_grad=requires_grad)
+        logger.info(f"Created body pose with shape: {hand_pose.shape}, requires_grad: {requires_grad}")
         
     def create_global_orient(self, global_orient, requires_grad=False):
         global_orient = axis_angle_to_rotation_6d(global_orient.reshape(-1, 3)).reshape(-1, 6)
@@ -241,10 +258,10 @@ class HUGS_TRIMLP:
         self,
         canon_forward_out,
         global_orient=None, 
-        body_pose=None, 
+        hand_pose=None, 
         betas=None, 
         transl=None, 
-        smpl_scale=None,
+        mano_scale=None,
         dataset_idx=-1,
         is_train=False,
         ext_tfs=None,
@@ -281,9 +298,9 @@ class HUGS_TRIMLP:
             global_orient = rotation_6d_to_axis_angle(
                 self.global_orient[dataset_idx].reshape(-1, 6)).reshape(3)
         
-        if hasattr(self, 'body_pose') and body_pose is None:
-            body_pose = rotation_6d_to_axis_angle(
-                self.body_pose[dataset_idx].reshape(-1, 6)).reshape(23*3)
+        if hasattr(self, 'hand_pose') and hand_pose is None:
+            hand_pose = rotation_6d_to_axis_angle(
+                self.hand_pose[dataset_idx].reshape(-1, 6)).reshape(23*3)
             
         if hasattr(self, 'betas') and betas is None:
             betas = self.betas
@@ -292,10 +309,11 @@ class HUGS_TRIMLP:
             transl = self.transl[dataset_idx]
         
         # vitruvian -> t-pose -> posed
+        # As for hand we require a vitruvian -> cano-pose -> posed
         # remove and reapply the blendshape
-        smpl_output = self.smpl(
+        mano_output = self.mano(
             betas=betas.unsqueeze(0),
-            body_pose=body_pose.unsqueeze(0),
+            mano_pose=hand_pose.unsqueeze(0),
             global_orient=global_orient.unsqueeze(0),
             disable_posedirs=False,
             return_full_pose=True,
@@ -303,11 +321,11 @@ class HUGS_TRIMLP:
         
         gt_lbs_weights = None
         if self.use_deformer:
-            A_t2pose = smpl_output.A[0]
+            A_t2pose = mano_output.A[0]
             A_vitruvian2pose = A_t2pose @ self.inv_A_t2vitruvian
             deformed_xyz, _, lbs_T, _, _ = lbs_extra(
                 A_vitruvian2pose[None], gs_xyz[None], posedirs, lbs_weights, 
-                smpl_output.full_pose, disable_posedirs=self.disable_posedirs, pose2rot=True
+                mano_output.full_pose, disable_posedirs=self.disable_posedirs, pose2rot=True
             )
             deformed_xyz = deformed_xyz.squeeze(0)
             lbs_T = lbs_T.squeeze(0)
@@ -315,7 +333,7 @@ class HUGS_TRIMLP:
             with torch.no_grad():
                 # gt lbs is needed for lbs regularization loss
                 # predicted lbs should be close to gt lbs
-                _, gt_lbs_weights = smpl_lbsweight_top_k(
+                _, gt_lbs_weights = mano_lbsweight_top_k(
                     lbs_weights=self.smpl.lbs_weights,
                     points=gs_xyz.unsqueeze(0),
                     template_points=self.vitruvian_verts.unsqueeze(0),
@@ -326,14 +344,14 @@ class HUGS_TRIMLP:
                 else:
                     logger.warning(f"GT LBS weights should sum to 1, but it is: {gt_lbs_weights.sum(-1).mean().item()}")
         else:
-            curr_offsets = (smpl_output.shape_offsets + smpl_output.pose_offsets)[0]
-            T_t2pose = smpl_output.T[0]
+            curr_offsets = (mano_output.shape_offsets + mano_output.pose_offsets)[0]
+            T_t2pose = mano_output.T[0]
             T_vitruvian2t = self.inv_T_t2vitruvian.clone()
             T_vitruvian2t[..., :3, 3] = T_vitruvian2t[..., :3, 3] + self.canonical_offsets - curr_offsets
             T_vitruvian2pose = T_t2pose @ T_vitruvian2t
 
-            _, lbs_T = smpl_lbsmap_top_k(
-                lbs_weights=self.smpl.lbs_weights,
+            _, lbs_T = mano_lbsmap_top_k(
+                lbs_weights=self.mano.lbs_weights,
                 verts_transform=T_vitruvian2pose.unsqueeze(0),
                 points=gs_xyz.unsqueeze(0),
                 template_points=self.vitruvian_verts.unsqueeze(0),
@@ -345,9 +363,9 @@ class HUGS_TRIMLP:
             gs_xyz_homo = torch.cat([gs_xyz, homogen_coord], dim=-1)
             deformed_xyz = torch.matmul(lbs_T, gs_xyz_homo.unsqueeze(-1))[..., :3, 0]
         
-        if smpl_scale is not None:
-            deformed_xyz = deformed_xyz * smpl_scale.unsqueeze(0)
-            gs_scales = gs_scales * smpl_scale.unsqueeze(0)
+        if mano_scale is not None:
+            deformed_xyz = deformed_xyz * mano_scale.unsqueeze(0)
+            gs_scales = gs_scales * mano_scale.unsqueeze(0)
         
         if transl is not None:
             deformed_xyz = deformed_xyz + transl.unsqueeze(0)
@@ -396,10 +414,10 @@ class HUGS_TRIMLP:
     def forward(
         self,
         global_orient=None, 
-        body_pose=None, 
+        hand_pose=None, 
         betas=None, 
         transl=None, 
-        smpl_scale=None,
+        mano_scale=None,
         dataset_idx=-1,
         is_train=False,
         ext_tfs=None,
@@ -443,9 +461,9 @@ class HUGS_TRIMLP:
             global_orient = rotation_6d_to_axis_angle(
                 self.global_orient[dataset_idx].reshape(-1, 6)).reshape(3)
         
-        if hasattr(self, 'body_pose') and body_pose is None:
-            body_pose = rotation_6d_to_axis_angle(
-                self.body_pose[dataset_idx].reshape(-1, 6)).reshape(23*3)
+        if hasattr(self, 'hand_pose') and hand_pose is None:
+            hand_pose = rotation_6d_to_axis_angle(
+                self.hand_pose[dataset_idx].reshape(-1, 6)).reshape(23*3)
             
         if hasattr(self, 'betas') and betas is None:
             betas = self.betas
@@ -455,9 +473,9 @@ class HUGS_TRIMLP:
         
         # vitruvian -> t-pose -> posed
         # remove and reapply the blendshape
-        smpl_output = self.smpl(
+        mano_output = self.mano(
             betas=betas.unsqueeze(0),
-            body_pose=body_pose.unsqueeze(0),
+            hand_pose=hand_pose.unsqueeze(0),
             global_orient=global_orient.unsqueeze(0),
             disable_posedirs=False,
             return_full_pose=True,
@@ -465,11 +483,11 @@ class HUGS_TRIMLP:
         
         gt_lbs_weights = None
         if self.use_deformer:
-            A_t2pose = smpl_output.A[0]
+            A_t2pose = mano_output.A[0]
             A_vitruvian2pose = A_t2pose @ self.inv_A_t2vitruvian
             deformed_xyz, _, lbs_T, _, _ = lbs_extra(
                 A_vitruvian2pose[None], gs_xyz[None], posedirs, lbs_weights, 
-                smpl_output.full_pose, disable_posedirs=self.disable_posedirs, pose2rot=True
+                mano_output.full_pose, disable_posedirs=self.disable_posedirs, pose2rot=True
             )
             deformed_xyz = deformed_xyz.squeeze(0)
             lbs_T = lbs_T.squeeze(0)
@@ -477,8 +495,8 @@ class HUGS_TRIMLP:
             with torch.no_grad():
                 # gt lbs is needed for lbs regularization loss
                 # predicted lbs should be close to gt lbs
-                _, gt_lbs_weights = smpl_lbsweight_top_k(
-                    lbs_weights=self.smpl.lbs_weights,
+                _, gt_lbs_weights = mano_lbsweight_top_k(
+                    lbs_weights=self.mano.lbs_weights,
                     points=gs_xyz.unsqueeze(0),
                     template_points=self.vitruvian_verts.unsqueeze(0),
                 )
@@ -488,14 +506,14 @@ class HUGS_TRIMLP:
                 else:
                     logger.warning(f"GT LBS weights should sum to 1, but it is: {gt_lbs_weights.sum(-1).mean().item()}")
         else:
-            curr_offsets = (smpl_output.shape_offsets + smpl_output.pose_offsets)[0]
-            T_t2pose = smpl_output.T[0]
+            curr_offsets = (mano_output.shape_offsets + mano_output.pose_offsets)[0]
+            T_t2pose = mano_output.T[0]
             T_vitruvian2t = self.inv_T_t2vitruvian.clone()
             T_vitruvian2t[..., :3, 3] = T_vitruvian2t[..., :3, 3] + self.canonical_offsets - curr_offsets
             T_vitruvian2pose = T_t2pose @ T_vitruvian2t
 
-            _, lbs_T = smpl_lbsmap_top_k(
-                lbs_weights=self.smpl.lbs_weights,
+            _, lbs_T = mano_lbsmap_top_k(
+                lbs_weights=self.mano.lbs_weights,
                 verts_transform=T_vitruvian2pose.unsqueeze(0),
                 points=gs_xyz.unsqueeze(0),
                 template_points=self.vitruvian_verts.unsqueeze(0),
@@ -507,9 +525,9 @@ class HUGS_TRIMLP:
             gs_xyz_homo = torch.cat([gs_xyz, homogen_coord], dim=-1)
             deformed_xyz = torch.matmul(lbs_T, gs_xyz_homo.unsqueeze(-1))[..., :3, 0]
         
-        if smpl_scale is not None:
-            deformed_xyz = deformed_xyz * smpl_scale.unsqueeze(0)
-            gs_scales = gs_scales * smpl_scale.unsqueeze(0)
+        if mano_scale is not None:
+            deformed_xyz = deformed_xyz * mano_scale.unsqueeze(0)
+            gs_scales = gs_scales * mano_scale.unsqueeze(0)
         
         if transl is not None:
             deformed_xyz = deformed_xyz + transl.unsqueeze(0)
@@ -560,31 +578,57 @@ class HUGS_TRIMLP:
             logger.info(f"Going from SH degree {self.active_sh_degree} to {self.active_sh_degree + 1}")
             self.active_sh_degree += 1
 
-    @torch.no_grad()
-    def get_vitruvian_verts(self):
-        vitruvian_pose = torch.zeros(69, dtype=self.smpl.dtype, device=self.device)
-        vitruvian_pose[2] = 1.0
-        vitruvian_pose[5] = -1.0
-        smpl_output = self.smpl(body_pose=vitruvian_pose[None], betas=self.betas[None], disable_posedirs=False)
-        vitruvian_verts = smpl_output.vertices[0]
-        self.A_t2vitruvian = smpl_output.A[0].detach()
-        self.T_t2vitruvian = smpl_output.T[0].detach()
-        self.inv_T_t2vitruvian = torch.inverse(self.T_t2vitruvian)
-        self.inv_A_t2vitruvian = torch.inverse(self.A_t2vitruvian)
-        self.canonical_offsets = smpl_output.shape_offsets + smpl_output.pose_offsets
-        self.canonical_offsets = self.canonical_offsets[0].detach()
-        self.vitruvian_verts = vitruvian_verts.detach()
-        return vitruvian_verts.detach()
+    # @torch.no_grad()
+    # def get_cano_hand_pose(self):
+    #     cano_hand_pose = torch.zeros(48, dtype=self.mano.dtype, device=self.device)
 
- # We can define the init hand pose here, the joint_num maybe 23   
+    # Updated
     @torch.no_grad()
-    def get_vitruvian_verts_template(self):
-        vitruvian_pose = torch.zeros(69, dtype=self.smpl_template.dtype, device=self.device)
-        vitruvian_pose[2] = 1.0
-        vitruvian_pose[5] = -1.0
-        smpl_output = self.smpl_template(body_pose=vitruvian_pose[None], betas=self.betas[None], disable_posedirs=False)
-        vitruvian_verts = smpl_output.vertices[0]
-        return vitruvian_verts.detach()
+    def get_cano_hand_verts(self):
+        cano_hand_pose = torch.zeros(48, dtype=self.mano.dtype, device=self.device)
+        mano_output = self.mano(hand_pose=cano_hand_pose[None], betas=self.betas[None], disable_posedirs=False)
+        cano_hand_verts = mano_output.vertices[0]
+        self.A_t2cano = mano_output.A[0].detach()
+        self.T_t2cano = mano_output.T[0].detach()
+        self.inv_T_t2cano = torch.inverse(self.T_t2cano)
+        self.inv_A_t2cano = torch.inverse(self.A_t2cano)
+        self.canonical_offsets = mano_output.shape_offsets + mano_output.pose_offsets
+        self.canonical_offsets = self.canonical_offsets[0].detach()
+        self.cano_verts = cano_hand_verts.detach()
+        return self.cano_verts.detach()
+    
+    @torch.no_grad()
+    def get_cano_verts_template(self):
+        cano_pose = torch.zeros(48, dtype=self.mano_template.dtype, device=self.device)
+        mano_output = self.mano_template(body_pose=cano_hand_pose[None], betas=self.betas[None], disable_posedirs=False)
+        cano_verts = mano_output.vertices[0]
+        return cano_verts.detach()
+    
+    # modified by lyt
+    def create_from_gaussian_params(self, params_path, name):
+        # Load mean and covariance from file
+        params = np.load(params_path)
+        mean = params['mean']
+        covariance = params['covariance']
+
+        # Convert mean and covariance to torch tensors
+        point_cloud = torch.tensor(mean).float().unsqueeze(0).cuda()
+        covariance_tensor = torch.tensor(covariance).float().cuda()
+
+        # Initialize features using covariance matrix information
+        features = torch.zeros((point_cloud.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = torch.diag(covariance_tensor)  # Example usage of covariance for feature initialization
+
+        print(f"Number of points at initialization (using {name} Gaussian):", point_cloud.shape[0])
+
+        # Initialize internal attributes based on the name
+        setattr(self, f"_{name}_xyz", point_cloud)
+        setattr(self, f"_{name}_features_dc", features)
+        setattr(self, f"_{name}_features_rest", torch.zeros_like(features))
+        setattr(self, f"_{name}_scaling", torch.ones((point_cloud.shape[0],)).cuda())
+        setattr(self, f"_{name}_rotation", torch.eye(3).repeat(point_cloud.shape[0], 1, 1).cuda())
+    # end of modification
+
     
     def train(self):
         pass
@@ -593,23 +637,24 @@ class HUGS_TRIMLP:
         pass
     
     def initialize(self):
-        t_pose_verts = self.get_vitruvian_verts_template()
+        # get_vitruvian_verts, hand pose is not t-pose
+        cano_pose_verts = self.get_cano_verts_template()
         
-        self.scaling_multiplier = torch.ones((t_pose_verts.shape[0], 1), device="cuda")
+        self.scaling_multiplier = torch.ones((cano_pose_verts.shape[0], 1), device="cuda")
         
-        xyz_offsets = torch.zeros_like(t_pose_verts)
-        colors = torch.ones_like(t_pose_verts) * 0.5
+        xyz_offsets = torch.zeros_like(cano_pose_verts)
+        colors = torch.ones_like(cano_pose_verts) * 0.5
         
         shs = torch.zeros((colors.shape[0], 3, 16)).float().cuda()
         shs[:, :3, 0 ] = colors
         shs[:, 3:, 1:] = 0.0
         shs = shs.transpose(1, 2).contiguous()
         
-        scales = torch.zeros_like(t_pose_verts)
-        for v in range(t_pose_verts.shape[0]):
+        scales = torch.zeros_like(cano_pose_verts)
+        for v in range(cano_pose_verts.shape[0]):
             selected_edges = torch.any(self.edges == v, dim=-1)
             selected_edges_len = torch.norm(
-                t_pose_verts[self.edges[selected_edges][0]] - t_pose_verts[self.edges[selected_edges][1]], 
+                cano_pose_verts[self.edges[selected_edges][0]] - cano_pose_verts[self.edges[selected_edges][1]], 
                 dim=-1
             )
             selected_edges_len *= self.init_scale_multiplier
@@ -629,7 +674,7 @@ class HUGS_TRIMLP:
             scales = torch.cat([scales, scale_z], dim=-1)
         
         import trimesh
-        mesh = trimesh.Trimesh(vertices=t_pose_verts.detach().cpu().numpy(), faces=self.smpl_template.faces)
+        mesh = trimesh.Trimesh(vertices=cano_pose_verts.detach().cpu().numpy(), faces=self.mano_template.faces)
         vert_normals = torch.tensor(mesh.vertex_normals).float().cuda()
         
         gs_normals = torch.zeros_like(vert_normals)
@@ -643,13 +688,13 @@ class HUGS_TRIMLP:
         self.normals = gs_normals
         deformed_normals = (norm_rotmat @ gs_normals.unsqueeze(-1)).squeeze(-1)
         
-        opacity = 0.1 * torch.ones((t_pose_verts.shape[0], 1), dtype=torch.float, device="cuda")
+        opacity = 0.1 * torch.ones((cano_pose_verts.shape[0], 1), dtype=torch.float, device="cuda")
         
-        posedirs = self.smpl_template.posedirs.detach().clone()
-        lbs_weights = self.smpl_template.lbs_weights.detach().clone()
+        posedirs = self.mano_template.posedirs.detach().clone()
+        lbs_weights = self.mano_template.lbs_weights.detach().clone()
 
-        self.n_gs = t_pose_verts.shape[0]
-        self._xyz = nn.Parameter(t_pose_verts.requires_grad_(True))
+        self.n_gs = cano_pose_verts.shape[0]
+        self._xyz = nn.Parameter(cano_pose_verts.requires_grad_(True))
         
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         return {
@@ -661,7 +706,7 @@ class HUGS_TRIMLP:
             'lbs_weights': lbs_weights,
             'posedirs': posedirs,
             'deformed_normals': deformed_normals,
-            'faces': self.smpl.faces_tensor,
+            'faces': self.mano.faces_tensor,
             'edges': self.edges,
         }
 
@@ -669,10 +714,10 @@ class HUGS_TRIMLP:
         self.percent_dense = cfg.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.spatial_lr_scale = cfg.smpl_spatial
+        self.spatial_lr_scale = cfg.mano_spatial
         
         params = [
-            {'params': [self._xyz], 'lr': cfg.position_init * cfg.smpl_spatial, "name": "xyz"},
+            {'params': [self._xyz], 'lr': cfg.position_init * cfg.mano_spatial, "name": "xyz"},
             {'params': self.triplane.parameters(), 'lr': cfg.vembed, 'name': 'v_embed'},
             {'params': self.geometry_dec.parameters(), 'lr': cfg.geometry, 'name': 'geometry_dec'},
             {'params': self.appearance_dec.parameters(), 'lr': cfg.appearance, 'name': 'appearance_dec'},
@@ -680,19 +725,19 @@ class HUGS_TRIMLP:
         ]
         
         if hasattr(self, 'global_orient') and self.global_orient.requires_grad:
-            params.append({'params': self.global_orient, 'lr': cfg.smpl_pose, 'name': 'global_orient'})
+            params.append({'params': self.global_orient, 'lr': cfg.mano_pose, 'name': 'global_orient'})
         
-        if hasattr(self, 'body_pose') and self.body_pose.requires_grad:
-            params.append({'params': self.body_pose, 'lr': cfg.smpl_pose, 'name': 'body_pose'})
+        if hasattr(self, 'hand_pose') and self.hand_pose.requires_grad:
+            params.append({'params': self.hand_pose, 'lr': cfg.mano_pose, 'name': 'hand_pose'})
             
         if hasattr(self, 'betas') and self.betas.requires_grad:
-            params.append({'params': self.betas, 'lr': cfg.smpl_betas, 'name': 'betas'})
+            params.append({'params': self.betas, 'lr': cfg.mano_betas, 'name': 'betas'})
             
         if hasattr(self, 'transl') and self.betas.requires_grad:
-            params.append({'params': self.transl, 'lr': cfg.smpl_trans, 'name': 'transl'})
+            params.append({'params': self.transl, 'lr': cfg.mano_trans, 'name': 'transl'})
         
         self.non_densify_params_keys = [
-            'global_orient', 'body_pose', 'betas', 'transl', 
+            'global_orient', 'hand_pose', 'betas', 'transl', 
             'v_embed', 'geometry_dec', 'appearance_dec', 'deform_dec',
         ]
         
@@ -701,8 +746,8 @@ class HUGS_TRIMLP:
 
         self.optimizer = torch.optim.Adam(params, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
-            lr_init=cfg.position_init  * cfg.smpl_spatial,
-            lr_final=cfg.position_final  * cfg.smpl_spatial,
+            lr_init=cfg.position_init  * cfg.mano_spatial,
+            lr_final=cfg.position_final  * cfg.mano_spatial,
             lr_delay_mult=cfg.position_delay_mult,
             max_steps=cfg.position_max_steps,
         )
