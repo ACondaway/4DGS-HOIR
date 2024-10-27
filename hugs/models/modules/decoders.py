@@ -109,3 +109,55 @@ class GeometryDecoder(torch.nn.Module):
             'rotations': rotations,
             'scales': scales,
         }
+
+class HOFeatureDecoder(torch.nn.Module):
+    def __init__(self, n_features, hidden_dim=128, act='gelu'):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        self.net = torch.nn.Sequential(
+            nn.Linear(n_features, self.hidden_dim),
+            act_fn_dict[act],
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            act_fn_dict[act],
+        )
+        self.hand_feat = nn.Linear(self.hidden_dim, n_features // 2)
+        self.obj_feat = nn.Linear(self.hidden_dim, n_features // 2)
+        
+    def forward(self, x):
+        x = self.net(x)
+        hand_feat = self.hand_feat(x)
+        obj_feat = self.obj_feat(x)
+        
+        return {
+            'hand_feat': hand_feat,
+            'obj_feat': obj_feat,
+        }
+
+
+class AllFeatureDecoder(torch.nn.Module):
+    def __init__(self, n_features, hidden_dim=128, act='gelu'):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        self.net = torch.nn.Sequential(
+            nn.Linear(n_features, self.hidden_dim),
+            act_fn_dict[act],
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            act_fn_dict[act],
+        )
+        self.left_hand_feat = nn.Linear(self.hidden_dim, n_features // 2)
+        self.right_hand_feat = nn.Linear(self.hidden_dim, n_features // 2)
+        self.obj_feat = nn.Linear(self.hidden_dim, n_features // 2)
+        
+    def forward(self, x):
+        x = self.net(x)
+        left_hand_feat = self.left_hand_feat(x)
+        right_hand_feat = self.right_hand_feat(x)
+        obj_feat = self.obj_feat(x)
+        
+        return {
+            'left_hand_feat': left_hand_feat,
+            'right_hand_feat': right_hand_feat,
+            'obj_feat': obj_feat,
+        }

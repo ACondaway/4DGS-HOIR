@@ -35,7 +35,10 @@ from hugs.utils.subdivide_mano import subdivide_mano_model
 from .modules.lbs import lbs_extra
 from .modules.mano_layer import MANO
 from .modules.triplane import TriPlane
-from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDecoder
+from .modules.decoders import AppearanceDecoder, DeformationDecoder, GeometryDecoder, HOFeatureDecoder, AllFeatureDecoder
+
+from .modules.xyzt_triplane import XYZTTriPlane
+from .modules.hexplane import HexPlaneField
 
 
 SCALE_Z = 1e-5
@@ -76,6 +79,7 @@ class BIHOGS_TRIMLP:
         triplane_res=256,
         betas=None,
         # modified by lyt
+        n_subfeatures=16,
         object_gaussian_params_path=None,
         left_hand_gaussian_params_path=None,
         right_hand_gaussian_params_path=None,
@@ -85,6 +89,7 @@ class BIHOGS_TRIMLP:
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
+        self._t = torch.empty(0)
         self.scaling_multiplier = torch.empty(0)
 
         self.max_radii2D = torch.empty(0)
@@ -106,12 +111,40 @@ class BIHOGS_TRIMLP:
         
         if betas is not None:
             self.create_betas(betas, requires_grad=False)
-        
-        self.triplane = TriPlane(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).to('cuda')
-        self.appearance_dec = AppearanceDecoder(n_features=n_features*3).to('cuda')
-        self.deformation_dec = DeformationDecoder(n_features=n_features*3, 
+        # modified by lyt
+        # self.triplane = TriPlane(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).to('cuda')
+        # self.appearance_dec = AppearanceDecoder(n_features=n_features*3).to('cuda')
+        # self.deformation_dec = DeformationDecoder(n_features=n_features*3, 
+        #                                           disable_posedirs=disable_posedirs).to('cuda')
+        self.left_hexplane = HexPlaneField(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).to('cuda')
+        self.right_hexplane = HexPlaneField(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).to('cuda')
+        self.obj_hexplane = HexPlaneField(n_features, resX=triplane_res, resY=triplane_res, resZ=triplane_res).to('cuda')
+        self.lo_feat_dec = HOFeatureDecoder(n_features=n_features*3*2).to('cuda')
+        self.ro_feat_dec = HOFeatureDecoder(n_features=n_features*3*2).to('cuda')
+        self.all_feat_dec = AllFeatureDecoder(n_features=n_features*3*3).to('cuda')
+        # self.time_feat_dec = SeqDecoder(n_code=n_code, n_features=n_features).to('cuda')             
+        self.left_appearance_dec = AppearanceDecoder(n_features=n_subfeatures*3*2).to('cuda')
+        self.left_deformation_dec = DeformationDecoder(n_features=n_subfeatures*3*2, 
                                                   disable_posedirs=disable_posedirs).to('cuda')
-        self.geometry_dec = GeometryDecoder(n_features=n_features*3, use_surface=use_surface).to('cuda')
+        self.left_geometry_dec = GeometryDecoder(n_features=n_subfeatures*3*2, use_surface=use_surface).to('cuda')
+        self.right_appearance_dec = AppearanceDecoder(n_features=n_subfeatures*3*2).to('cuda')
+        self.right_deformation_dec = DeformationDecoder(n_features=n_subfeatures*3*2, 
+                                                  disable_posedirs=disable_posedirs).to('cuda')
+        self.right_geometry_dec = GeometryDecoder(n_features=n_subfeatures*3*2, use_surface=use_surface).to('cuda')
+        self.obj_appearance_dec = AppearanceDecoder(n_features=n_subfeatures*3*3).to('cuda')
+        # rigid obj, no deformation
+        # self.deformation_dec = DeformationDecoder(n_features=n_features*3, 
+        #                                           disable_posedirs=disable_posedirs).to('cuda')
+        self.obj_geometry_dec = GeometryDecoder(n_features=n_subfeatures*3*3, use_surface=use_surface).to('cuda')
+        # self.total_geometry_dec = GeometryDecoder(n_features=n_features*3*3, use_surface=use_surface).to('cuda')
+        # self.total_appearance_dec = AppearanceDecoder(n_features=n_features*3*3).to('cuda')
+        # end of modification
+        #        
+        # self.hexplane = HexPlaneField().to('cuda')
+        # self.appearance_dec = AppearanceDecoder(n_features=n_features*3).to('cuda')
+        # self.deformation_dec = DeformationDecoder(n_features=n_features*3, 
+        #                                           disable_posedirs=disable_posedirs).to('cuda')
+        # self.geometry_dec = GeometryDecoder(n_features=n_features*3, use_surface=use_surface).to('cuda')
         
         if n_subdivision > 0:
             logger.info(f"Subdividing MANO model {n_subdivision} times")
@@ -166,11 +199,15 @@ class BIHOGS_TRIMLP:
     def get_xyz(self):
         return self._xyz
     
+    @property
+    def get_t(self):
+        return self._t
+    
     def state_dict(self):
         save_dict = {
             'active_sh_degree': self.active_sh_degree,
             'xyz': self._xyz,
-            'triplane': self.triplane.state_dict(),
+            'hexplane': self.hexplane.state_dict(),
             'appearance_dec': self.appearance_dec.state_dict(),
             'geometry_dec': self.geometry_dec.state_dict(),
             'deformation_dec': self.deformation_dec.state_dict(),
@@ -192,7 +229,7 @@ class BIHOGS_TRIMLP:
         opt_dict = state_dict['optimizer']
         self.spatial_lr_scale = state_dict['spatial_lr_scale']
         
-        self.triplane.load_state_dict(state_dict['triplane'])
+        self.hexplane.load_state_dict(state_dict['hexplane'])
         self.appearance_dec.load_state_dict(state_dict['appearance_dec'])
         self.geometry_dec.load_state_dict(state_dict['geometry_dec'])
         self.deformation_dec.load_state_dict(state_dict['deformation_dec'])
@@ -220,7 +257,8 @@ class BIHOGS_TRIMLP:
         return repr_str
 
     def canon_forward(self):
-        tri_feats = self.triplane(self.get_xyz)
+        x = torch.concatenate(self.get_xyz, self.get_t)
+        tri_feats = self.hexplane(x)
         appearance_out = self.appearance_dec(tri_feats)
         geometry_out = self.geometry_dec(tri_feats)
         
@@ -422,8 +460,8 @@ class BIHOGS_TRIMLP:
         is_train=False,
         ext_tfs=None,
     ):
-        
-        tri_feats = self.triplane(self.get_xyz)
+        x = torch.concatenate(self.get_xyz, self.get_t)
+        tri_feats = self.hexplane(x)
         appearance_out = self.appearance_dec(tri_feats)
         geometry_out = self.geometry_dec(tri_feats)
         
@@ -480,7 +518,7 @@ class BIHOGS_TRIMLP:
             disable_posedirs=False,
             return_full_pose=True,
         )
-        
+        betas = mano_output.betas
         gt_lbs_weights = None
         if self.use_deformer:
             A_t2pose = mano_output.A[0]
@@ -589,7 +627,7 @@ class BIHOGS_TRIMLP:
         mano_output = self.mano(hand_pose=cano_hand_pose[None], betas=self.betas[None], disable_posedirs=False)
         cano_hand_verts = mano_output.vertices[0]
         self.A_t2cano = mano_output.A[0].detach()
-        self.T_t2cano = mano_output.T[0].detach()
+        self.T_t2cano  = mano_output.T[0].detach()
         self.inv_T_t2cano = torch.inverse(self.T_t2cano)
         self.inv_A_t2cano = torch.inverse(self.A_t2cano)
         self.canonical_offsets = mano_output.shape_offsets + mano_output.pose_offsets
@@ -599,7 +637,7 @@ class BIHOGS_TRIMLP:
     
     @torch.no_grad()
     def get_cano_verts_template(self):
-        cano_pose = torch.zeros(48, dtype=self.mano_template.dtype, device=self.device)
+        cano_hand_pose = torch.zeros(48, dtype=self.mano_template.dtype, device=self.device)
         mano_output = self.mano_template(body_pose=cano_hand_pose[None], betas=self.betas[None], disable_posedirs=False)
         cano_verts = mano_output.vertices[0]
         return cano_verts.detach()
@@ -718,7 +756,7 @@ class BIHOGS_TRIMLP:
         
         params = [
             {'params': [self._xyz], 'lr': cfg.position_init * cfg.mano_spatial, "name": "xyz"},
-            {'params': self.triplane.parameters(), 'lr': cfg.vembed, 'name': 'v_embed'},
+            {'params': self.hexlane.parameters(), 'lr': cfg.vembed, 'name': 'v_embed'},
             {'params': self.geometry_dec.parameters(), 'lr': cfg.geometry, 'name': 'geometry_dec'},
             {'params': self.appearance_dec.parameters(), 'lr': cfg.appearance, 'name': 'appearance_dec'},
             {'params': self.deformation_dec.parameters(), 'lr': cfg.deformation, 'name': 'deform_dec'},
